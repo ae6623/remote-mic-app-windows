@@ -543,6 +543,13 @@ const EDITOR_SEMANTIC_HINTS: &[&str] = &[
     "slate-editor",
 ];
 
+/// 冷树判据：Chromium 在 UIA 客户端尚未连接时只暴露 0–2 个占位节点，
+/// 候选自然为空。此类结果不值得直接判「没有输入框」，应触发一次
+/// 可访问性树预热后重扫（见 `focus_windows::warm_accessibility`）。
+pub(crate) fn scan_tree_is_cold(total: usize, candidates: usize) -> bool {
+    candidates == 0 && total <= 8
+}
+
 impl FocusCandidate {
     /// 控制类型是否是文本输入类（mac 的 `AXTextArea` / `AXTextField` 等价物）。
     pub fn is_text_control(&self) -> bool {
@@ -1533,6 +1540,15 @@ mod tests {
         assert!((rect.y - 0.2).abs() < 1e-9);
         assert!((rect.width - 0.2).abs() < 1e-9);
         assert!((rect.height - 0.25).abs() < 1e-9);
+    }
+
+    #[test]
+    fn cold_tree_requires_empty_candidates_and_tiny_tree() {
+        assert!(scan_tree_is_cold(0, 0));
+        assert!(scan_tree_is_cold(2, 0));
+        assert!(scan_tree_is_cold(8, 0));
+        assert!(!scan_tree_is_cold(9, 0), "正常应用树不应触发预热重扫");
+        assert!(!scan_tree_is_cold(2, 1), "已有候选时不需要预热");
     }
 
     #[test]

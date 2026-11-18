@@ -175,10 +175,16 @@ mod imp {
 
     fn collect_candidates(
         automation: &IUIAutomation,
+        hwnd: HWND,
         root: &IUIAutomationElement,
         frame: (f64, f64, f64, f64),
     ) -> Vec<Candidate> {
-        let started = Instant::now();
+        let class = crate::focus_windows::window_class_name(hwnd);
+        let chromium = class.starts_with("Chrome_WidgetWin_");
+        // Chromium 的可访问性树是按需构建的：客户端未连接时 FindAll 只返回
+        // 0–2 个占位节点。冷树时预热并重扫，否则会把「没有滚动容器」误记成
+        // 整窗回退，之后永远只发滚轮、不再使用 ScrollPattern。
+        let attempts = if chromium { 3 } else { 1 };
         let condition = unsafe {
             automation.CreatePropertyCondition(
                 UIA_IsScrollPatternAvailablePropertyId,
@@ -188,29 +194,46 @@ mod imp {
         let Ok(condition) = condition else {
             return Vec::new();
         };
-        let array = unsafe { root.FindAll(TreeScope_Descendants, &condition) };
-        let Ok(array) = array else {
-            return Vec::new();
-        };
-        let count = unsafe { array.Length() }.unwrap_or(0).max(0) as usize;
-        let mut candidates = Vec::new();
-        for index in 0..count.min(MAX_SCROLL_ELEMENTS) {
-            let Ok(element) = (unsafe { array.GetElement(index as i32) }) else {
-                continue;
+        for attempt in 0..attempts {
+            let started = Instant::now();
+            let Ok(array) = (unsafe { root.FindAll(TreeScope_Descendants, &condition) }) else {
+                return Vec::new();
             };
-            if let Some((descriptor, _)) = element_descriptor(&element, frame) {
-                candidates.push(Candidate {
-                    element,
-                    descriptor,
-                });
+            let count = unsafe { array.Length() }.unwrap_or(0).max(0) as usize;
+            let mut candidates = Vec::new();
+            for index in 0..count.min(MAX_SCROLL_ELEMENTS) {
+                let Ok(element) = (unsafe { array.GetElement(index as i32) }) else {
+                    continue;
+                };
+                if let Some((descriptor, _)) = element_descriptor(&element, frame) {
+                    candidates.push(Candidate {
+                        element,
+                        descriptor,
+                    });
+                }
             }
+            crate::ble::gatt_note(format!(
+                "scroll_scan phase=completed hwnd={:#x} class={class} chromium={chromium} \
+                 attempt={attempt} elements={count} candidates={} elapsed_ms={}",
+                hwnd.0 as isize,
+                candidates.len(),
+                started.elapsed().as_millis()
+            ));
+            if !candidates.is_empty() {
+                return candidates;
+            }
+            let cold = crate::focus::scan_tree_is_cold(count, 0);
+            if !cold || attempt + 1 >= attempts {
+                break;
+            }
+            crate::ble::gatt_note(format!(
+                "scroll_scan phase=retry hwnd={:#x} attempt={attempt} reason=cold_tree elements={count}",
+                hwnd.0 as isize
+            ));
+            crate::focus_windows::warm_accessibility(automation, hwnd);
+            std::thread::sleep(Duration::from_millis(150));
         }
-        crate::ble::gatt_note(format!(
-            "scroll_scan phase=completed elements={count} candidates={} elapsed_ms={}",
-            candidates.len(),
-            started.elapsed().as_millis()
-        ));
-        candidates
+        Vec::new()
     }
 
     fn target_from_candidate(descriptor: &ScrollRegionDescriptor) -> Option<ScrollRegionTarget> {
@@ -221,10 +244,17 @@ mod imp {
     /// 没有 ScrollPattern 容器时退回到整窗矩形（滚轮回退路径）。
     fn learn_in_session(
         automation: &IUIAutomation,
-        _pid: u32,
+        pid: u32,
         hwnd: HWND,
     ) -> Result<ScrollRegionTarget, ScrollFailure> {
         let frame = window_frame(automation, hwnd).ok_or(ScrollFailure::NotAccessible)?;
+        crate::ble::gatt_note(format!(
+            "scroll_learn_target pid={pid} hwnd={:#x} class={} window={}x{}",
+            hwnd.0 as isize,
+            crate::focus_windows::window_class_name(hwnd),
+            frame.2,
+            frame.3
+        ));
         let (wx, wy, ww, wh) = frame;
         let deadline = Instant::now() + Duration::from_millis(SCROLL_LEARN_WINDOW_MS);
         let mut was_down = left_button_down();
@@ -258,7 +288,7 @@ mod imp {
         }
         let root = unsafe { automation.ElementFromHandle(hwnd) }
             .map_err(|_| ScrollFailure::NotAccessible)?;
-        let candidates = collect_candidates(automation, &root, frame);
+        let candidates = collect_candidates(automation, hwnd, &root, frame);
         let normalized_x = (cursor_x - wx) / ww;
         let normalized_y = (cursor_y - wy) / wh;
         let mut hits: Vec<&Candidate> = candidates
@@ -377,6 +407,13 @@ mod imp {
         // 优先真实滚轮输入：Chromium/Electron 的渲染子窗口会忽略 PostMessage。
         // 只有光标定位或输入被拒绝时才退回旧的消息投递路径。
         let wheel_input_result = wheel_input(center, delta, notches);
+        if wheel_input_result.is_none() {
+            crate::ble::gatt_note(format!(
+                "scroll_execute method=wheel input=send_input command={} \
+                 terminal_result=fallback reason=input_rejected",
+                command.as_str()
+            ));
+        }
         if let Some(restored) = wheel_input_result {
             std::thread::sleep(Duration::from_millis(160));
             let after = pattern.and_then(vertical_percent);
@@ -414,7 +451,7 @@ mod imp {
         let lparam = ((y as usize) << 16) | (x as usize);
         let wparam = ((delta as u16 as usize) << 16) & 0xffff_0000;
         for _ in 0..notches {
-            unsafe {
+            if unsafe {
                 PostMessageW(
                     Some(target),
                     WM_MOUSEWHEEL,
@@ -422,7 +459,15 @@ mod imp {
                     LPARAM(lparam as isize),
                 )
             }
-            .map_err(|_| ScrollFailure::Backend)?;
+            .is_err()
+            {
+                crate::ble::gatt_note(format!(
+                    "scroll_execute method=wheel input=post_message command={} \
+                     terminal_result=failed reason=backend",
+                    command.as_str()
+                ));
+                return Err(ScrollFailure::Backend);
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         std::thread::sleep(Duration::from_millis(160));
@@ -506,12 +551,20 @@ mod imp {
 
     fn scroll_in_session(
         automation: &IUIAutomation,
-        _pid: u32,
+        pid: u32,
         hwnd: HWND,
         target: Option<ScrollRegionTarget>,
         command: ScrollCommand,
     ) -> Result<ScrollOutcome, ScrollFailure> {
         let frame = window_frame(automation, hwnd).ok_or(ScrollFailure::NotAccessible)?;
+        crate::ble::gatt_note(format!(
+            "scroll_execute_target pid={pid} hwnd={:#x} class={} command={} window={}x{}",
+            hwnd.0 as isize,
+            crate::focus_windows::window_class_name(hwnd),
+            command.as_str(),
+            frame.2,
+            frame.3
+        ));
         let fallback_center = target
             .as_ref()
             .and_then(|target| target.normalized_rect)
@@ -531,7 +584,7 @@ mod imp {
         }
         let root = unsafe { automation.ElementFromHandle(hwnd) }
             .map_err(|_| ScrollFailure::NotAccessible)?;
-        let candidates = collect_candidates(automation, &root, frame);
+        let candidates = collect_candidates(automation, hwnd, &root, frame);
         let descriptors: Vec<ScrollRegionDescriptor> = candidates
             .iter()
             .map(|candidate| candidate.descriptor.clone())

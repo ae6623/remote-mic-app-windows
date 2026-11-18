@@ -24,7 +24,9 @@ mod imp {
     use std::time::{Duration, Instant};
 
     use windows::core::{Interface, BSTR, PCWSTR};
-    use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, VARIANT_FALSE, VARIANT_TRUE};
+    use windows::Win32::Foundation::{
+        HWND, LPARAM, POINT, RECT, VARIANT_FALSE, VARIANT_TRUE, WPARAM,
+    };
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_INPROC_SERVER,
         COINIT_MULTITHREADED,
@@ -37,20 +39,21 @@ mod imp {
     use windows::Win32::UI::Accessibility::{
         CUIAutomation, IUIAutomation, IUIAutomationCacheRequest, IUIAutomationCondition,
         IUIAutomationElement, IUIAutomationElementArray, IUIAutomationValuePattern,
-        TreeScope_Descendants, UIA_AutomationIdPropertyId, UIA_BoundingRectanglePropertyId,
-        UIA_ClassNamePropertyId, UIA_ControlTypePropertyId, UIA_DocumentControlTypeId,
-        UIA_EditControlTypeId, UIA_GroupControlTypeId, UIA_HasKeyboardFocusPropertyId,
-        UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId, UIA_IsPasswordPropertyId,
-        UIA_IsTextPatternAvailablePropertyId, UIA_NamePropertyId, UIA_TextPatternId,
-        UIA_ValuePatternId, UIA_CONTROLTYPE_ID, UIA_PATTERN_ID,
+        TreeScope_Children, TreeScope_Descendants, UIA_AutomationIdPropertyId,
+        UIA_BoundingRectanglePropertyId, UIA_ClassNamePropertyId, UIA_ControlTypePropertyId,
+        UIA_DocumentControlTypeId, UIA_EditControlTypeId, UIA_GroupControlTypeId,
+        UIA_HasKeyboardFocusPropertyId, UIA_IsEnabledPropertyId, UIA_IsKeyboardFocusablePropertyId,
+        UIA_IsPasswordPropertyId, UIA_IsTextPatternAvailablePropertyId, UIA_NamePropertyId,
+        UIA_TextPatternId, UIA_ValuePatternId, UIA_CONTROLTYPE_ID, UIA_PATTERN_ID,
     };
     use windows::Win32::UI::HiDpi::{
         GetThreadDpiAwarenessContext, SetThreadDpiAwarenessContext,
         DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
     };
     use windows::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetForegroundWindow, GetPhysicalCursorPos, GetWindowThreadProcessId, IsIconic,
-        IsWindowVisible,
+        EnumChildWindows, EnumWindows, GetClassNameW, GetForegroundWindow, GetPhysicalCursorPos,
+        GetWindowThreadProcessId, IsIconic, IsWindowVisible, SendMessageTimeoutW, OBJID_CLIENT,
+        SMTO_ABORTIFHUNG, WM_GETOBJECT,
     };
 
     /// 单次遍历的元素上限（防止异常应用把树撑爆）。
@@ -205,14 +208,28 @@ mod imp {
         alive
     }
 
-    /// 目标进程当前可交互的顶层窗口（可见优先；全部隐藏时退回最大的隐藏主窗口），
-    /// 供 UIA 扫描使用。返回 `(hwnd, 是否有可见窗口)`。
+    /// 窗口类名（`GetClassNameW` 包装；失败为空串）。只用于选择后端与日志，
+    /// 不读取标题或其他内容。
+    pub(crate) fn window_class_name(hwnd: HWND) -> String {
+        let mut buffer = [0u16; 256];
+        let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
+        if length <= 0 {
+            return String::new();
+        }
+        String::from_utf16_lossy(&buffer[..length as usize])
+    }
+
+    /// 目标进程当前可交互的顶层窗口（可见且未最小化时取**面积最大**的一个；
+    /// 全部隐藏时退回最大的隐藏主窗口），供 UIA 扫描使用。返回
+    /// `(hwnd, 是否有可见窗口)`。
+    ///
+    /// 不再「取 Z 序第一个可见窗口」：Chromium/Electron 会创建 1×1 的辅助
+    /// 顶层窗口，Z 序靠前时会被误选，随后扫描/学习得到 `window=1x1`。
     fn target_window(pid: u32) -> Option<(HWND, bool)> {
         struct Context {
             pid: u32,
-            visible: Option<HWND>,
-            hidden: Option<HWND>,
-            hidden_area: i64,
+            visible: Option<(HWND, i64)>,
+            hidden: Option<(HWND, i64)>,
         }
         unsafe extern "system" fn callback(hwnd: HWND, lparam: LPARAM) -> windows::core::BOOL {
             let context = unsafe { &mut *(lparam.0 as *mut Context) };
@@ -221,19 +238,22 @@ mod imp {
             if window_pid != context.pid {
                 return true.into();
             }
-            if unsafe { IsWindowVisible(hwnd) }.as_bool() && !unsafe { IsIconic(hwnd) }.as_bool() {
-                context.visible = Some(hwnd);
-                return false.into(); // 找到第一个可见窗口即停止枚举（Z 序最前）
-            }
             let mut rect = RECT::default();
             if unsafe { windows::Win32::UI::WindowsAndMessaging::GetWindowRect(hwnd, &mut rect) }
-                .is_ok()
+                .is_err()
             {
-                let area = i64::from(rect.right - rect.left) * i64::from(rect.bottom - rect.top);
-                if area > context.hidden_area {
-                    context.hidden_area = area;
-                    context.hidden = Some(hwnd);
-                }
+                return true.into();
+            }
+            let area = i64::from(rect.right - rect.left) * i64::from(rect.bottom - rect.top);
+            let slot = if unsafe { IsWindowVisible(hwnd) }.as_bool()
+                && !unsafe { IsIconic(hwnd) }.as_bool()
+            {
+                &mut context.visible
+            } else {
+                &mut context.hidden
+            };
+            if slot.is_none_or(|(_, best)| area > best) {
+                *slot = Some((hwnd, area));
             }
             true.into()
         }
@@ -242,7 +262,6 @@ mod imp {
             pid,
             visible: None,
             hidden: None,
-            hidden_area: 0,
         };
         unsafe {
             let _ = EnumWindows(
@@ -251,10 +270,55 @@ mod imp {
             );
         }
         match (context.visible, context.hidden) {
-            (Some(hwnd), _) => Some((hwnd, true)),
-            (None, Some(hwnd)) => Some((hwnd, false)),
+            (Some((hwnd, _)), _) => Some((hwnd, true)),
+            (None, Some((hwnd, _))) => Some((hwnd, false)),
             (None, None) => None,
         }
+    }
+
+    /// 触发 Chromium/Electron 的按需可访问性。
+    ///
+    /// Chromium 只有在检测到 UIA 客户端（`WM_GETOBJECT`/UIA 调用）后才构建
+    /// 完整可访问性树；在此之前 `FindAll` 只会返回 0–2 个占位节点。这里向
+    /// 顶层窗口与渲染子窗口发送 `WM_GETOBJECT(OBJID_CLIENT)`，再做一次浅层
+    /// 查询把客户端标记置位。调用方随后等待一小段时间让渲染进程建树。
+    pub(crate) fn warm_accessibility(automation: &IUIAutomation, hwnd: HWND) {
+        unsafe extern "system" fn warm_child(hwnd: HWND, _: LPARAM) -> windows::core::BOOL {
+            let mut buffer = [0u16; 256];
+            let length = unsafe { GetClassNameW(hwnd, &mut buffer) };
+            if length > 0 {
+                let class = String::from_utf16_lossy(&buffer[..length as usize]);
+                if class.contains("Chrome_RenderWidgetHost") || class.contains("Chrome_WidgetWin") {
+                    unsafe { request_accessible(hwnd) };
+                }
+            }
+            true.into()
+        }
+
+        unsafe {
+            request_accessible(hwnd);
+            let _ = EnumChildWindows(Some(hwnd), Some(warm_child), LPARAM(0));
+        }
+        if let Ok(root) = unsafe { automation.ElementFromHandle(hwnd) } {
+            if let Ok(condition) = unsafe { automation.CreateTrueCondition() } {
+                let _ = unsafe { root.FindAll(TreeScope_Children, &condition) };
+            }
+        }
+    }
+
+    unsafe fn request_accessible(hwnd: HWND) {
+        let mut result = 0usize;
+        let _ = unsafe {
+            SendMessageTimeoutW(
+                hwnd,
+                WM_GETOBJECT,
+                WPARAM(0),
+                LPARAM(OBJID_CLIENT.0 as isize),
+                SMTO_ABORTIFHUNG,
+                100,
+                Some(&mut result),
+            )
+        };
     }
 
     // ---------- UIA ----------
@@ -512,6 +576,8 @@ mod imp {
         /// 与 `candidates` 同序的元素引用：`focus_target` 直接用它 `SetFocus`，
         /// 不再第二次全树扫描（原先这条重复扫描让一次尝试翻倍）。
         elements: Vec<IUIAutomationElement>,
+        /// 本次遍历看到的元素总数（冷树判据的一部分）。
+        total: usize,
     }
 
     /// 候选门槛档位：自动选择用硬门槛（排除地址栏等），
@@ -600,7 +666,8 @@ mod imp {
         }
     }
 
-    /// 一次枚举：优先用批量缓存；provider 忽略缓存时整批回退非缓存。
+    /// 一次枚举：优先用批量缓存；provider 忽略缓存、或树明显是冷占位节点时
+    /// 回退非缓存。
     fn find_all(
         automation: &IUIAutomation,
         root: &IUIAutomationElement,
@@ -608,8 +675,10 @@ mod imp {
         window_frame: Option<(f64, f64, f64, f64)>,
         gate: CandidateGate,
         level: &'static str,
+        attempt: usize,
         started: Instant,
     ) -> Option<ScanBatch> {
+        let mut fallback_batch = None;
         if let Some(cache) = build_cache_request(automation) {
             if let Ok(array) =
                 unsafe { root.FindAllBuildCache(TreeScope_Descendants, condition, &cache) }
@@ -617,28 +686,43 @@ mod imp {
                 let batch = collect_from(&array, window_frame, gate, true);
                 // provider 忽略缓存请求时，缓存属性会成批为空：整批作废、回退非缓存。
                 if batch.total == 0 || batch.blank < batch.total {
+                    let cold = crate::focus::scan_tree_is_cold(batch.total, batch.candidates.len());
                     crate::ble::gatt_note(format!(
-                        "focus_scan level={level} path=cache elements={} candidates={} \
-                         blank={} elapsed_ms={}",
+                        "focus_scan level={level} path=cache attempt={attempt} elements={} \
+                         candidates={} blank={} cold={cold} elapsed_ms={}",
                         batch.total,
                         batch.candidates.len(),
                         batch.blank,
                         started.elapsed().as_millis()
                     ));
-                    return Some(batch);
+                    if !cold {
+                        return Some(batch);
+                    }
+                    crate::ble::gatt_note(format!(
+                        "focus_scan level={level} path=cache attempt={attempt} \
+                         terminal_result=fallback reason=cold_tree elements={} elapsed_ms={}",
+                        batch.total,
+                        started.elapsed().as_millis()
+                    ));
+                    fallback_batch = Some(batch);
+                } else {
+                    crate::ble::gatt_note(format!(
+                        "focus_scan level={level} path=cache attempt={attempt} \
+                         terminal_result=fallback reason=cache_ignored elements={} elapsed_ms={}",
+                        batch.total,
+                        started.elapsed().as_millis()
+                    ));
                 }
-                crate::ble::gatt_note(format!(
-                    "focus_scan level={level} path=cache terminal_result=fallback \
-                     reason=cache_ignored elements={} elapsed_ms={}",
-                    batch.total,
-                    started.elapsed().as_millis()
-                ));
             }
         }
-        let elements = unsafe { root.FindAll(TreeScope_Descendants, condition) }.ok()?;
+        let elements = match unsafe { root.FindAll(TreeScope_Descendants, condition) } {
+            Ok(elements) => elements,
+            Err(_) => return fallback_batch,
+        };
         let batch = collect_from(&elements, window_frame, gate, false);
         crate::ble::gatt_note(format!(
-            "focus_scan level={level} path=plain elements={} candidates={} blank={} elapsed_ms={}",
+            "focus_scan level={level} path=plain attempt={attempt} elements={} candidates={} \
+             blank={} elapsed_ms={}",
             batch.total,
             batch.candidates.len(),
             batch.blank,
@@ -647,35 +731,33 @@ mod imp {
         Some(batch)
     }
 
-    fn collect_candidates(
-        session: &Session,
-        hwnd: HWND,
+    /// 单次扫描：先窄条件后全树。抽出来供「冷树重试」复用。
+    fn scan_once(
+        automation: &IUIAutomation,
+        root: &IUIAutomationElement,
+        window_frame: Option<(f64, f64, f64, f64)>,
         gate: CandidateGate,
+        attempt: usize,
     ) -> Result<ScanResult, FocusFailure> {
         let started = Instant::now();
-        let automation = &session.automation;
-        let root = unsafe { automation.ElementFromHandle(hwnd) }
-            .map_err(|_| FocusFailure::NotAccessible)?;
-        let window_frame = unsafe { root.CurrentBoundingRectangle() }
-            .ok()
-            .and_then(|rect| sane_rect(&rect));
-
         // 第一档：类型条件（provider 侧过滤）。已实测的全部正例都落在
         // Edit/Document/Group 里，所以正常情况在这一档就结束。
         if let Some(narrow) = candidate_condition(automation) {
             if let Some(batch) = find_all(
                 automation,
-                &root,
+                root,
                 &narrow,
                 window_frame,
                 gate,
                 "narrow",
+                attempt,
                 started,
             ) {
                 if !batch.candidates.is_empty() {
                     return Ok(ScanResult {
                         candidates: batch.candidates,
                         elements: batch.elements,
+                        total: batch.total,
                     });
                 }
             }
@@ -685,18 +767,68 @@ mod imp {
             unsafe { automation.CreateTrueCondition() }.map_err(|_| FocusFailure::NotAccessible)?;
         let batch = find_all(
             automation,
-            &root,
+            root,
             &wide,
             window_frame,
             gate,
             "wide",
+            attempt,
             started,
         )
         .ok_or(FocusFailure::NotAccessible)?;
         Ok(ScanResult {
             candidates: batch.candidates,
             elements: batch.elements,
+            total: batch.total,
         })
+    }
+
+    fn collect_candidates(
+        session: &Session,
+        hwnd: HWND,
+        gate: CandidateGate,
+    ) -> Result<ScanResult, FocusFailure> {
+        let automation = &session.automation;
+        let class = window_class_name(hwnd);
+        let chromium = class.starts_with("Chrome_WidgetWin_");
+        crate::ble::gatt_note(format!(
+            "focus_scan_target hwnd={:#x} class={class} chromium={chromium} gate={}",
+            hwnd.0 as isize,
+            match gate {
+                CandidateGate::Auto => "auto",
+                CandidateGate::Recorded => "recorded",
+            }
+        ));
+        let root = unsafe { automation.ElementFromHandle(hwnd) }
+            .map_err(|_| FocusFailure::NotAccessible)?;
+        let window_frame = unsafe { root.CurrentBoundingRectangle() }
+            .ok()
+            .and_then(|rect| sane_rect(&rect));
+        let attempts = if chromium { 3 } else { 1 };
+        let mut last = ScanResult {
+            candidates: Vec::new(),
+            elements: Vec::new(),
+            total: 0,
+        };
+        for attempt in 0..attempts {
+            let scan = scan_once(automation, &root, window_frame, gate, attempt)?;
+            let cold = crate::focus::scan_tree_is_cold(scan.total, scan.candidates.len());
+            let retrying = cold && attempt + 1 < attempts;
+            if !scan.candidates.is_empty() {
+                return Ok(scan);
+            }
+            last = scan;
+            if !retrying {
+                break;
+            }
+            crate::ble::gatt_note(format!(
+                "focus_scan_retry attempt={attempt} reason=cold_tree elements={} candidates=0",
+                last.total
+            ));
+            warm_accessibility(automation, hwnd);
+            std::thread::sleep(Duration::from_millis(150));
+        }
+        Ok(last)
     }
 
     /// 扫描目标进程当前窗口的可编辑候选（语义快照，不含输入内容）。
@@ -909,8 +1041,12 @@ mod imp {
             .and_then(|rect| sane_rect(&rect))?;
         if cursor_x < wx || cursor_y < wy || cursor_x > wx + ww || cursor_y > wy + wh {
             crate::ble::gatt_note(format!(
-                "focus_learn_cursor terminal_result=skipped reason=outside_window window={}x{}",
-                ww, wh
+                "focus_learn_cursor terminal_result=skipped reason=outside_window pid={pid} \
+                 hwnd={:#x} class={} window={}x{}",
+                hwnd.0 as isize,
+                window_class_name(hwnd),
+                ww,
+                wh
             ));
             return None;
         }
@@ -930,8 +1066,10 @@ mod imp {
             })
             .collect();
         crate::ble::gatt_note(format!(
-            "focus_learn_cursor phase=hit_test normalized_x={:.3} normalized_y={:.3} \
-             candidates={} hits={} window={}x{}",
+            "focus_learn_cursor phase=hit_test pid={pid} hwnd={:#x} class={} \
+             normalized_x={:.3} normalized_y={:.3} candidates={} hits={} window={}x{}",
+            hwnd.0 as isize,
+            window_class_name(hwnd),
             x,
             y,
             scan.candidates.len(),
@@ -1049,7 +1187,18 @@ mod imp {
     }
 
     /// 供诊断：把 `HWND` 转成指针宽度（跨线程传递用）。
+    ///
+    /// 前台窗口属于目标进程时直接返回它：滚动语义是「滚我正在看的窗口」，
+    /// 这比按面积挑主窗口更准确（弹窗/多窗口应用）。
     pub fn window_of_process(pid: u32) -> Option<isize> {
+        let foreground = unsafe { GetForegroundWindow() };
+        if !foreground.is_invalid() {
+            let mut window_pid = 0u32;
+            unsafe { GetWindowThreadProcessId(foreground, Some(&mut window_pid)) };
+            if window_pid == pid {
+                return Some(foreground.0 as isize);
+            }
+        }
         target_window(pid).map(|(hwnd, _)| hwnd.0 as isize)
     }
 
@@ -1080,7 +1229,9 @@ pub use imp::{
 
 /// 复用共享 UIA 工作线程（Per-Monitor V2、MTA）执行只读 UIA 任务的入口。
 #[cfg(windows)]
-pub(crate) use imp::{with_automation, with_automation_timeout};
+pub(crate) use imp::{
+    warm_accessibility, window_class_name, with_automation, with_automation_timeout,
+};
 
 /// 非 Windows 平台不提供 UIA 后端；保持模块可编译以便纯逻辑单测。
 #[cfg(not(windows))]
